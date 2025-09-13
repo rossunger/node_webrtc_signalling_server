@@ -257,7 +257,8 @@ async function joinLobby(peer, pLobby, mesh) {
 		if (peer.lobby !== '') {
 			throw new ProtoError(4000, STR_ALREADY_IN_LOBBY);
 		}
-		lobbyName = codeGenerator.generateCode(); // randomSecret();
+		lobbyName = await codeGenerator.generateCode(); // randomSecret();
+		console.log(`generated lobby name: ${lobbyName}`)
 		lobbies.set(lobbyName, new Lobby(lobbyName, peer.id, mesh));
 		console.log(`Peer ${peer.id} created lobby ${lobbyName}`);
 		console.log(`Open lobbies: ${lobbies.size}`);
@@ -321,7 +322,7 @@ async function parseMsg(peer, msg) {
 	}
 
 	// Lobby joining.
-	if (type === CMD.JOIN) {
+	if (type === CMD.JOIN) {		
 		await joinLobby(peer, data, id === 0);
 		return;
 	}
