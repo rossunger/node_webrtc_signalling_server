@@ -339,7 +339,7 @@ const lobbies = new Map();
 let peersCount = 0;
 
 async function joinLobby(peer, pLobby, mesh) {
-	let lobbyName = pLobby;
+	let lobbyName = pLobby.toUpperCase();
 	let isRestoredGame = false;
 	let savedGameState = null;	
 	

@@ -4,9 +4,9 @@
 class SequentialCodeGenerator {
     constructor() {
         // Base-34 alphabet (excludes 0, 1, I, O to avoid confusion)
-        this.ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-        this.BASE = this.ALPHABET.length; // 34
-        this.CODE_LENGTH = 4;
+        this.ALPHABET = 'ABCDEFGHIJKLMNPQRSTUVWXYZ123456789';
+        this.BASE = this.ALPHABET.length; // 32
+        this.CODE_LENGTH = 6;
         
         // Persistent counter - in production, store this in your database
         this.counter = this.loadCounter();
