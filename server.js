@@ -1,8 +1,10 @@
 const WebSocket = require('ws');
 const crypto = require('crypto');
+const mysql = require('mysql2/promise');
 const { EnhancedSequentialCodeGenerator } = require('./sequential_code_generator');
 const codeGenerator = new EnhancedSequentialCodeGenerator();
 
+const MAX_SAVE_GAMES = 1; //10000
 const MAX_PEERS = 4096;
 const MAX_LOBBIES = 1024*1024;
 const PORT = process.env.PORT || 5050;
@@ -44,6 +46,45 @@ const CMD = {
 	GAME_STATE: 9,
 	SAVE_GAME: 10,
 };
+const sql_pool = mysql.createPool({
+		host: 'rossunger.com',     // Your hosting DB hostname
+		user: process.env.DB_USER, // set these via env vars
+		password: process.env.DB_PASS,
+		database: process.env.DB_NAME,
+		waitForConnections: true,
+		connectionLimit: 5,
+		queueLimit: 0
+	});
+
+async function save_to_db(code, state) {
+	try {
+		await sql_pool.query(
+		`INSERT INTO sessions (code, save_state)
+			VALUES (?, ?)
+			ON DUPLICATE KEY UPDATE 
+			save_state = VALUES(save_state),
+			updated_at = CURRENT_TIMESTAMP`,
+		[code, JSON.stringify(state)]
+		);
+		console.log(`💾 Saved state for room ${code}`);
+	} catch (err) {
+		console.error("❌ DB save error:", err);
+	}
+}
+async function load_from_db(code){
+	try {
+		const [rows] = await sql_pool.query(
+			"SELECT save_state FROM sessions WHERE code = ?",
+			[code]
+		);		
+		if (rows.length === 0) return null;
+		const saveState = rows[0].save_state; // Buffer with your binary data
+		return saveState;
+	} catch (err) {
+		console.error("❌ DB load error:", err);
+	}	
+}
+	  
 
 // Simple in-memory database for saved games
 // In production, replace this with your actual database
@@ -58,6 +99,7 @@ class GameStateDB {
 				gameState,
 				timestamp: Date.now()
 			});
+			this.saveOldestGameIfNeeded()
 			console.log(`Saved game state for lobby ${joinCode}`);
 			return true;
 		} catch (error) {
@@ -69,11 +111,20 @@ class GameStateDB {
 	async loadGame(joinCode) {
 		try {
 			const savedGame = this.savedGames.get(joinCode);
-			if (savedGame) {
-				// Remove from database after loading (single use)
-				this.savedGames.delete(joinCode);
+			if (savedGame) {								
 				return savedGame.gameState;
+			}else{
+				let saveState = load_from_db(joinCode)
+				if (saveState){
+					this.savedGames.set(joinCode, saveState)
+					this.saveOldestGameIfNeeded()
+					return saveState				
+				}else{
+					console.log(`No game exists, even in db, for ${joinCode}`);
+				}
+				
 			}
+			
 			return null;
 		} catch (error) {
 			console.error('Error loading game state:', error);
@@ -84,25 +135,35 @@ class GameStateDB {
 	async hasGame(joinCode) {
 		return this.savedGames.has(joinCode);
 	}
+	getOldestSave() {
+		let oldest_code = null;
+		let oldestTime = Infinity;	
+		for (const [key, value] of this.savedGames.entries()) {
+			if (value.timestamp < oldestTime) {
+				oldestTime = value.timestamp;
+				oldest_code = key;
+			}
+		}
+		return oldest_code
+	}
+	saveOldestGameIfNeeded(){
+		if (this.savedGames.size > MAX_SAVE_GAMES){
+			let oldest_code = this.getOldestSave()		
+			if (oldest_code !== null) {
+				let save_state = this.savedGames.get(oldest_code)
+				save_to_db(oldest_code, save_state)
+				this.savedGames.delete(oldest_code);		
+			}
+		}		
+	}
 }
 
 const gameStateDB = new GameStateDB();
-
-function randomInt(low, high) {
-	return Math.floor(Math.random() * (high - low + 1) + low);
-}
 
 function randomId() {
 	return Math.abs(new Int32Array(crypto.randomBytes(4).buffer)[0]);
 }
 
-function randomSecret() {
-	let out = '';
-	for (let i = 0; i < CODE_LENGTH; i++) {
-		out += ALFNUM[randomInt(0, ALFNUM.length - 1)];
-	}
-	return out;
-}
 
 function ProtoMessage(type, id, data) {
 	return JSON.stringify({
@@ -194,9 +255,9 @@ class Lobby {
 				newHost.ws.send(ProtoMessage(CMD.HOST_CHANGED, 1, STR_NEW_HOST));
 				
 				// Notify all other peers about host change
-				this.peers.slice(1).forEach((p) => {
-					p.ws.send(ProtoMessage(CMD.HOST_CHANGED, this.getPeerId(newHost), STR_HOST_CHANGED));
-				});
+				// this.peers.slice(1).forEach((p) => {
+				// 	p.ws.send(ProtoMessage(CMD.HOST_CHANGED, this.getPeerId(newHost), STR_HOST_CHANGED));
+				// });
 				
 				console.log(`Host migrated from ${peer.id} to ${newHost.id} in lobby ${this.name}`);
 				
@@ -249,7 +310,8 @@ async function joinLobby(peer, pLobby, mesh) {
 	let isRestoredGame = false;
 	let savedGameState = null;
 	
-	if (lobbyName === '') {
+
+	if (lobbyName === '') { 
 		if (lobbies.size >= MAX_LOBBIES) {
 			throw new ProtoError(4000, STR_TOO_MANY_LOBBIES);
 		}
@@ -263,28 +325,27 @@ async function joinLobby(peer, pLobby, mesh) {
 		console.log(`Peer ${peer.id} created lobby ${lobbyName}`);
 		console.log(`Open lobbies: ${lobbies.size}`);
 	} else {
-		// Check if this is a saved game
-		savedGameState = await gameStateDB.loadGame(lobbyName);
-		if (savedGameState) {
-			isRestoredGame = true;
-			// Create new lobby with this peer as host
-			if (peer.lobby !== '') {
-				throw new ProtoError(4000, STR_ALREADY_IN_LOBBY);
-			}
-			const lobby = new Lobby(lobbyName, peer.id, mesh);
-			lobby.gameState = savedGameState;
-			lobbies.set(lobbyName, lobby);
-			console.log(`Peer ${peer.id} restored lobby ${lobbyName} from saved game`);
-		} else {
-			// Try to join existing lobby
-			const lobby = lobbies.get(lobbyName);
-			if (!lobby) {
+		const lobby = lobbies.get(lobbyName);
+		if (!lobby) {				
+			// Check if this is a saved game
+			savedGameState = await gameStateDB.loadGame(lobbyName);
+			if (savedGameState) {
+				isRestoredGame = true;
+				// Create new lobby with this peer as host
+				if (peer.lobby !== '') {
+					throw new ProtoError(4000, STR_ALREADY_IN_LOBBY);
+				}
+				const lobby = new Lobby(lobbyName, peer.id, mesh);
+				lobby.gameState = savedGameState;
+				lobbies.set(lobbyName, lobby);
+				console.log(`Peer ${peer.id} restored lobby ${lobbyName} from saved game`);
+			}else{
 				throw new ProtoError(4000, STR_LOBBY_DOES_NOT_EXISTS);
 			}
-			if (lobby.sealed) {
-				throw new ProtoError(4000, STR_LOBBY_IS_SEALED);
-			}
-		}
+		} 													
+		if (lobby.sealed) {
+			throw new ProtoError(4000, STR_LOBBY_IS_SEALED);
+		}		
 	}
 	
 	const lobby = lobbies.get(lobbyName);
@@ -293,8 +354,7 @@ async function joinLobby(peer, pLobby, mesh) {
 	}
 	
 	peer.lobby = lobbyName;
-	console.log(`Peer ${peer.id} joining lobby ${lobbyName} `
-		+ `with ${lobby.peers.length} peers`);
+	console.log(`Peer ${peer.id} joining lobby ${lobbyName} with ${lobby.peers.length} peers`);
 	lobby.join(peer);
 	peer.ws.send(ProtoMessage(CMD.JOIN, 0, lobbyName));
 	
@@ -402,11 +462,16 @@ wss.on('connection', (ws) => {
 	});
 	ws.on('close', async (code, reason) => {
 		peersCount--;
-		console.log(`Connection with peer ${peer.id} closed `
-			+ `with reason ${code}: ${reason}`);
+		console.log(`Connection with peer ${peer.id} closed with reason ${code}: ${reason}`);
 		if (peer.lobby && lobbies.has(peer.lobby)) {
 			const shouldClose = await lobbies.get(peer.lobby).leave(peer);
 			if (shouldClose) {
+				if (peer.lobby.gameState) {
+					const saved = await gameStateDB.saveGame(peer.lobby, peer.lobby.gameState);
+					if (saved) {
+						console.log(`Saved game state for lobby ${peer.lobby} before deletion`);
+					}
+				}
 				lobbies.delete(peer.lobby);
 				console.log(`Deleted lobby ${peer.lobby}`);
 				console.log(`Open lobbies: ${lobbies.size}`);
