@@ -151,7 +151,7 @@ class GameStateDB {
 			let oldest_code = this.getOldestSave()		
 			if (oldest_code !== null) {
 				let save_state = this.savedGames.get(oldest_code)
-				save_to_db(oldest_code, save_state)
+				save_to_db(oldest_code, save_state.gameState)
 				this.savedGames.delete(oldest_code);		
 			}
 		}		
