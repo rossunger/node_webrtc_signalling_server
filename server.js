@@ -64,7 +64,7 @@ async function save_to_db(code, state) {
 			ON DUPLICATE KEY UPDATE 
 			save_state = VALUES(save_state),
 			updated_at = CURRENT_TIMESTAMP`,
-		[code, JSON.stringify(state)]
+		[code, state]
 		);
 		console.log(`💾 Saved state for room ${code}`);
 	} catch (err) {
@@ -360,7 +360,7 @@ async function joinLobby(peer, pLobby, mesh) {
 	
 	// If this is a restored game, send the game state to the new host
 	if (isRestoredGame && savedGameState) {
-		peer.ws.send(ProtoMessage(CMD.GAME_STATE, 0, JSON.stringify(savedGameState)));
+		peer.ws.send(ProtoMessage(CMD.GAME_STATE, 0, savedGameState));
 		console.log(`Sent saved game state to new host ${peer.id}`);
 	}
 }
@@ -401,7 +401,7 @@ async function parseMsg(peer, msg) {
 			throw new ProtoError(4000, 'Only host can save game state');
 		}
 		try {
-			const gameState = JSON.parse(data);
+			const gameState = data;
 			lobby.updateGameState(gameState);
 			peer.ws.send(ProtoMessage(CMD.SAVE_GAME, 0, 'Game state saved'));
 		} catch (e) {
