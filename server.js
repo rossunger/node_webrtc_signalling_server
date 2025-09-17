@@ -2,9 +2,10 @@ const WebSocket = require('ws');
 const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 const { EnhancedSequentialCodeGenerator } = require('./sequential_code_generator');
+const { safeQuery } = require('./sql');
 const codeGenerator = new EnhancedSequentialCodeGenerator();
 
-const MAX_SAVE_GAMES = 1; //10000
+const MAX_SAVE_GAMES = 10000
 const MAX_PEERS = 4096;
 const MAX_LOBBIES = 1024*1024;
 const PORT = process.env.PORT || 5050;
@@ -46,6 +47,8 @@ const CMD = {
 	GAME_STATE: 9,
 	SAVE_GAME: 10,
 };
+
+/*
 const sql_pool = mysql.createPool({
 		host: 'rossunger.com',     // Your hosting DB hostname
 		user: process.env.DB_USER, // set these via env vars
@@ -55,10 +58,39 @@ const sql_pool = mysql.createPool({
 		connectionLimit: 5,
 		queueLimit: 0
 	});
+*/
+
+async function backup_save_games() {	
+	try {
+		const placeholders = Array.from(gameStateDB.savedGames, () => "(?, ?)").join(", ");
+		const values = [];
+
+		for (const [code, state] of gameStateDB.savedGames) {
+			values.push(code, state);
+		}
+		//await sql_pool.query(
+		await safeQuery(		
+			`
+			INSERT INTO sessions (code, save_state)
+			VALUES ${placeholders}
+			ON DUPLICATE KEY UPDATE
+				save_state = VALUES(save_state),
+				updated_at = CURRENT_TIMESTAMP
+			`,
+			values
+		);
+		console.log(`💾 Backed up all saves to DB`);
+	} catch (err) {
+		console.error("❌ DB backup failed. save error:", err);
+	}
+}
+let backup_save_games_interval = setInterval(backup_save_games
+, 76000000); // 1000 milliseconds = 1 second
 
 async function save_to_db(code, state) {
 	try {
-		await sql_pool.query(
+		//await sql_pool.query(
+		await safeQuery(
 		`INSERT INTO sessions (code, save_state)
 			VALUES (?, ?)
 			ON DUPLICATE KEY UPDATE 
@@ -72,12 +104,13 @@ async function save_to_db(code, state) {
 	}
 }
 async function load_from_db(code){
-	try {
-		const [rows] = await sql_pool.query(
+	try{ 
+		//const [rows] = await sql_pool.query({
+		const [rows] = await safeQuery(
 			"SELECT save_state FROM sessions WHERE code = ?",
 			[code]
 		);		
-		if (rows.length === 0) return null;
+		if (rozws.length === 0) return null;
 		const saveState = rows[0].save_state; // Buffer with your binary data
 		return saveState;
 	} catch (err) {
@@ -308,9 +341,8 @@ let peersCount = 0;
 async function joinLobby(peer, pLobby, mesh) {
 	let lobbyName = pLobby;
 	let isRestoredGame = false;
-	let savedGameState = null;
+	let savedGameState = null;	
 	
-
 	if (lobbyName === '') { 
 		if (lobbies.size >= MAX_LOBBIES) {
 			throw new ProtoError(4000, STR_TOO_MANY_LOBBIES);
@@ -325,7 +357,7 @@ async function joinLobby(peer, pLobby, mesh) {
 		console.log(`Peer ${peer.id} created lobby ${lobbyName}`);
 		console.log(`Open lobbies: ${lobbies.size}`);
 	} else {
-		const lobby = lobbies.get(lobbyName);
+		let lobby = lobbies.get(lobbyName);
 		if (!lobby) {				
 			// Check if this is a saved game
 			savedGameState = await gameStateDB.loadGame(lobbyName);
@@ -335,7 +367,7 @@ async function joinLobby(peer, pLobby, mesh) {
 				if (peer.lobby !== '') {
 					throw new ProtoError(4000, STR_ALREADY_IN_LOBBY);
 				}
-				const lobby = new Lobby(lobbyName, peer.id, mesh);
+				lobby = new Lobby(lobbyName, peer.id, mesh);
 				lobby.gameState = savedGameState;
 				lobbies.set(lobbyName, lobby);
 				console.log(`Peer ${peer.id} restored lobby ${lobbyName} from saved game`);
@@ -360,12 +392,25 @@ async function joinLobby(peer, pLobby, mesh) {
 	
 	// If this is a restored game, send the game state to the new host
 	if (isRestoredGame && savedGameState) {
-		peer.ws.send(ProtoMessage(CMD.GAME_STATE, 0, savedGameState));
+		peer.ws.send( savedGameState, { binary: true } );
 		console.log(`Sent saved game state to new host ${peer.id}`);
 	}
 }
 
 async function parseMsg(peer, msg) {
+	if (typeof msg !== 'string') {
+		// Game state saving (only host can save)		
+		let lobby = lobbies.get(peer.lobby)
+		if (peer.id !== lobby.host) {
+			throw new ProtoError(4000, 'Only host can save game state');
+		}
+		try {			
+			lobby.updateGameState(msg);			
+		} catch (e) {
+			throw new ProtoError(4000, 'Invalid game state format');
+		}
+		return;		
+	}
 	let json = null;
 	try {
 		json = JSON.parse(msg);
@@ -390,25 +435,11 @@ async function parseMsg(peer, msg) {
 	if (!peer.lobby) {
 		throw new ProtoError(4000, STR_NEED_LOBBY);
 	}
-	const lobby = lobbies.get(peer.lobby);
+	let lobby = lobbies.get(peer.lobby);
 	if (!lobby) {
 		throw new ProtoError(4000, STR_SERVER_ERROR);
 	}
 
-	// Game state saving (only host can save)
-	if (type === CMD.SAVE_GAME) {
-		if (peer.id !== lobby.host) {
-			throw new ProtoError(4000, 'Only host can save game state');
-		}
-		try {
-			const gameState = data;
-			lobby.updateGameState(gameState);
-			peer.ws.send(ProtoMessage(CMD.SAVE_GAME, 0, 'Game state saved'));
-		} catch (e) {
-			throw new ProtoError(4000, 'Invalid game state format');
-		}
-		return;
-	}
 
 	// Lobby sealing.
 	if (type === CMD.SEAL) {
@@ -448,10 +479,6 @@ wss.on('connection', (ws) => {
 	const id = randomId();
 	const peer = new Peer(id, ws);
 	ws.on('message', async (message) => {
-		if (typeof message !== 'string') {
-			ws.close(4000, STR_INVALID_TRANSFER_MODE);
-			return;
-		}
 		try {
 			await parseMsg(peer, message);
 		} catch (e) {
